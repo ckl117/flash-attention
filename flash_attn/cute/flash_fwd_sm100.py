@@ -299,6 +299,7 @@ class FlashAttentionForwardSm100:
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        # (s_q, d, h, b) or (total_q, d, h) if there is cu_seqlens_q
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
@@ -312,6 +313,7 @@ class FlashAttentionForwardSm100:
             LSE_layout_transpose = [3, 2, 1, 0] if const_expr(mCuSeqlensQ is None) else [2, 1, 0]
             num_splits = mO.shape[0]
         else:
+            # (s_q, dv, h, b) or (total_q, dv, h) if there is cu_seqlens_q
             O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             num_splits = Int32(1)
@@ -321,13 +323,17 @@ class FlashAttentionForwardSm100:
             if const_expr(mLSE is not None)
             else None
         )
-        # (s, d, h, b) -> (d, s, h, b)
+        # (s, d, h, b) -> (d, s, h, b) or (total_v, d, h_v) -> (d, total_v, h_v)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
+        # (total_q, d, h):(h*d, 1, d) row major = major:k
         self.q_major_mode = cutlass.utils.LayoutEnum.from_tensor(mQ).mma_major_mode()
+        # (total_k, d, h):(h*d, 1, d) row major = major:k
         self.k_major_mode = cutlass.utils.LayoutEnum.from_tensor(mK).mma_major_mode()
+        # (d, total_v, h):(1, h*d, d) col major = major:mn
         self.v_major_mode = cutlass.utils.LayoutEnum.from_tensor(mV).mma_major_mode()
+        # (total_q, dv, h):(h*d, 1, dv) row major
         self.o_layout = cutlass.utils.LayoutEnum.from_tensor(mO)
 
         if const_expr(self.q_major_mode != tcgen05.OperandMajorMode.K):
@@ -355,60 +361,65 @@ class FlashAttentionForwardSm100:
         # the intermediate tensor p is from tmem & mK-major
         p_source = tcgen05.OperandSource.TMEM
         p_major_mode = tcgen05.OperandMajorMode.K
+        # [m_block_size, n_block_size, 16]
         tiled_mma_qk = sm100_utils_basic.make_trivial_tiled_mma(
             self.q_dtype,
             self.q_major_mode,
             self.k_major_mode,
             self.qk_acc_dtype,
             cta_group,
-            self.mma_tiler_qk[:2],
+            self.mma_tiler_qk[:2], # [m_block_size, n_block_size]
         )
+        # [m_block_size, head_dim_v_padded, 16]
         tiled_mma_pv = sm100_utils_basic.make_trivial_tiled_mma(
             self.v_dtype,
             p_major_mode,
             self.v_major_mode,
             self.pv_acc_dtype,
             cta_group,
-            self.mma_tiler_pv[:2],
+            self.mma_tiler_pv[:2], # [m_block_size, head_dim_v_padded]
             p_source,
         )
 
+        # (1, 1, 1)
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
+        # (1, 1, 1)
         self.cluster_layout_vmnk = cute.tiled_divide(
             cute.make_layout(self.cluster_shape_mnk),
             (tiled_mma_qk.thr_id.shape,),
         )
 
+        # [m_block_size, head_dim_v_padded]
         self.epi_tile = self.mma_tiler_pv[:2]
 
         sQ_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_qk,
-            self.mma_tiler_qk,
+            self.mma_tiler_qk, # [m_block_size, n_block_size, head_dim_padded]
             self.q_dtype,
             self.q_stage,
         )
         sK_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_qk,
-            self.mma_tiler_qk,
+            self.mma_tiler_qk, # [m_block_size, n_block_size, head_dim_padded]
             self.k_dtype,
             self.kv_stage,
         )
         tP_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_pv,
-            self.mma_tiler_pv,
+            self.mma_tiler_pv, # [m_block_size, head_dim_v_padded, n_block_size]
             self.q_dtype,
             self.acc_stage,
         )
         sV_layout = sm100_utils_basic.make_smem_layout_b(
             tiled_mma_pv,
-            self.mma_tiler_pv,
+            self.mma_tiler_pv, # [m_block_size, head_dim_v_padded, n_block_size]
             self.v_dtype,
             self.kv_stage,
         )
         sO_layout = sm100_utils_basic.make_smem_layout_epi(
             self.o_dtype,
-            self.o_layout,
-            self.epi_tile,
+            self.o_layout, # (total_q, dv, h):(h*d, 1, dv)
+            self.epi_tile, # [m_block_size, head_dim_v_padded]
             self.q_stage,
         )
         if const_expr(not self.same_hdim_kv_padded):
@@ -440,33 +451,39 @@ class FlashAttentionForwardSm100:
             )
 
         if const_expr(self.pack_gqa):
+            # (total_q, d, h) -> ((qhead_per_kvhead, total_q), d, h)
             shape_Q_packed = (
                 (self.qhead_per_kvhead, mQ.shape[0]),
                 mQ.shape[1],
                 mK.shape[2],
                 *mQ.shape[3:],
             )
+            # (h*d, 1, d) -> ((d, h*d), 1, d*qhead_per_kvhead)
             stride_Q_packed = (
                 (mQ.stride[2], mQ.stride[0]),
                 mQ.stride[1],
                 mQ.stride[2] * self.qhead_per_kvhead,
                 *mQ.stride[3:],
             )
+            # ((qhead_per_kvhead, total_q), d, h):((d, h*d), 1, d*qhead_per_kvhead)
             mQ = cute.make_tensor(
                 mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed)
             )
+            # (total_q, dv, h) -> ((qhead_per_kvhead, total_q), dv, h)
             shape_O_packed = (
                 (self.qhead_per_kvhead, mO.shape[0]),
                 mO.shape[1],
                 mK.shape[2],
                 *mO.shape[3:],
             )
+            # (h*d, 1, dv) -> ((d, h*d), 1, dv*qhead_per_kvhead)
             stride_O_packed = (
                 (mO.stride[2], mO.stride[0]),
                 mO.stride[1],
                 mO.stride[2] * self.qhead_per_kvhead,
                 *mO.stride[3:],
             )
+            # ((qhead_per_kvhead, total_q), dv, h): ((d, h*d), 1, dv*qhead_per_kvhead)
             mO = cute.make_tensor(
                 mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed)
             )
@@ -529,10 +546,12 @@ class FlashAttentionForwardSm100:
         else:
             tma_atom_K = None
             tma_atom_V = None
-
+        
+        # mO=(total_q, dv, h), self.epi_tile=(m_block_size, self.head_dim_v_padded)
         o_cta_v_layout = cute.composition(cute.make_identity_layout(mO.shape), self.epi_tile)
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+        # false
         if const_expr(self.use_tma_O):
             tma_atom_O, mO = cpasync.make_tiled_tma_atom(
                 tma_store_op,
