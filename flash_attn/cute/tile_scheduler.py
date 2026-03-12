@@ -509,7 +509,7 @@ class SingleTileVarlenScheduler:
         tile_shape_mn: cutlass.Constexpr[Tuple[int, int]]
         mCuSeqlensQ: Optional[cute.Tensor] = None
         mSeqUsedQ: Optional[cute.Tensor] = None
-        qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1
+        qhead_per_kvhead_packgqa: cutlass.Constexpr[int] = 1 # 1 if not pack_gqa
         lpt: cutlass.Constexpr[bool] = False
         is_split_kv: cutlass.Constexpr[bool] = False
         head_swizzle: cutlass.Constexpr[bool] = False
@@ -520,7 +520,9 @@ class SingleTileVarlenScheduler:
         def create(
             args: TileSchedulerArguments, *, loc=None, ip=None
         ) -> "SingleTileVarlenScheduler.Params":
+            # max 126 MB
             size_l2 = 50 * 1024 * 1024  # 50 MB for K & V
+            # 800
             max_kvblock_in_l2 = size_l2 // (
                 (args.headdim + args.headdim_v) * args.element_size * args.tile_shape_mn[1]
             )
@@ -569,6 +571,7 @@ class SingleTileVarlenScheduler:
         loc=None,
         ip=None,
     ) -> Tuple[Int32, Int32, Int32]:
+        # 8
         total_blocks_max = (
             params.total_q
             + params.num_batch * (params.cluster_shape_m * params.tile_shape_mn[0] - 1)
@@ -604,6 +607,7 @@ class SingleTileVarlenScheduler:
     def get_current_work(self, *, loc=None, ip=None) -> WorkTileInfo:
         params = self.params
         lane_idx = cute.arch.lane_idx()
+        # 前 0-30 batch_id 的CTA_m 数量: ceil_div(seq_len, stage_q * m_blocks)
         num_m_blocks = self._get_num_m_blocks(lane_idx, bidb_start=0)
         num_m_blocks_cumulative = utils.warp_prefix_sum(num_m_blocks, lane_idx)
         # Total number of blocks for the next 31 batches

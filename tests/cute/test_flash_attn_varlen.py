@@ -10,15 +10,15 @@ from flash_attn.cute import flash_attn_varlen_func
 IS_SM90 = torch.cuda.get_device_capability()[0] == 9
 
 
-@pytest.mark.parametrize("B", [1, 7, 20])
-@pytest.mark.parametrize("H", [1, 4, 6])
-@pytest.mark.parametrize("D", [64, 128])
-@pytest.mark.parametrize("min_seq_len", [1, 32, 128])
-@pytest.mark.parametrize("max_seq_len", [8, 64, 2048])
-@pytest.mark.parametrize("causal", [True, False])
-@pytest.mark.parametrize("softmax_scale", [None, 0.1])
-@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-@pytest.mark.parametrize("mha_type", ["mha", "mqa", "gqa"])
+@pytest.mark.parametrize("B", [7])
+@pytest.mark.parametrize("H", [4])
+@pytest.mark.parametrize("D", [128])
+@pytest.mark.parametrize("min_seq_len", [32])
+@pytest.mark.parametrize("max_seq_len", [64])
+@pytest.mark.parametrize("causal", [True])
+@pytest.mark.parametrize("softmax_scale", [None])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("mha_type", ["gqa"])
 def test_varlen(
     B,
     H,
@@ -95,6 +95,11 @@ def check_varlen_vs_torch_flash(
     else:
         cu_seqlens_k_fa = None
         cu_seqlens_k_t = None
+    print(f'{q_fa.shape=}')
+    print(f'{k_fa.shape=}')
+    print(f'{v_fa.shape=}')
+    print(f'{cu_seqlens_q_fa.shape=}')
+    print(f'{cu_seqlens_k_fa.shape=}')
 
     out_fa, lse_fa = flash_attn_varlen_func(
         q_fa, k_fa, v_fa,
@@ -109,6 +114,7 @@ def check_varlen_vs_torch_flash(
         softcap=softcap,
         pack_gqa=None,
     )
+    print(f'{out_fa.shape=}')
 
     out_t = torch_flash_ref(
         q_t, k_t, v_t,

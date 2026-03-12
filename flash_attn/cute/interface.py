@@ -297,6 +297,8 @@ def _flash_attn_fwd(
         max_seqlen_k = seqlen_k
     seqlen_q_packgqa = max_seqlen_q * qhead_per_kvhead
     if arch // 10 == 10:
+        # Q数量足够多时，会让每个CTA处理2个Q，从而达到论文中写的流水线？
+        # 为什么选择这个判断条件?
         q_stage = 2 if seqlen_q_packgqa > m_block_size else 1
     else:
         q_stage = 1
@@ -473,6 +475,7 @@ def _flash_attn_fwd(
         elif arch // 10 in [10, 11]:
             head_dim_padded = int(math.ceil(head_dim / 16) * 16)
             head_dim_v_padded = int(math.ceil(head_dim / 16) * 16)
+            # 变长为False
             use_2cta_instrs = (
                 not causal
                 and not local

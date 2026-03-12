@@ -91,14 +91,14 @@ class FlashAttentionForwardSm100:
         q_subtile_factor: int | None = None,
         m_block_size: int = 128,
         n_block_size: int = 128,
-        q_stage: cutlass.Constexpr[int] = 2,
-        is_persistent: bool = True,
+        q_stage: cutlass.Constexpr[int] = 2, # q_stage = 2 if total_q * qhead_per_kvhead > m_block_size else 1
+        is_persistent: bool = True,  # varlen时为False
         score_mod: cutlass.Constexpr | None = None,
         mask_mod: cutlass.Constexpr | None = None,
         has_aux_tensors: cutlass.Constexpr = False,
         paged_kv_non_tma: bool = False,
         is_varlen_q: bool = False,
-        use_2cta_instrs: bool = False,
+        use_2cta_instrs: bool = False,  # varlen 时为False
     ):
         self.use_tma_KV = not paged_kv_non_tma
         # self.dtype = dtype
@@ -119,8 +119,8 @@ class FlashAttentionForwardSm100:
         # If split_P_arrive, the softmax warps write some columns of P first, signal to the MMA warp
         # to being the P @ V MMA, then write the rest of P and signal again. This allows some overlap
         # between compute the last couple columns of P and the P @ V MMA.
-        self.split_P_arrive = n_block_size // 4 * 3
-        self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32
+        self.split_P_arrive = n_block_size // 4 * 3    # 96
+        self.split_P_arrive = int(self.split_P_arrive / 32) * 32  # multiple of 32, final 96
         assert self.split_P_arrive % 32 == 0
         assert self.split_P_arrive < self.n_block_size
         self.arch = BaseDSL._get_dsl().get_arch_enum()
@@ -143,7 +143,7 @@ class FlashAttentionForwardSm100:
         self.use_correction_warps_for_epi = is_varlen_q
         self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = is_split_kv
-        self.pack_gqa = pack_gqa
+        self.pack_gqa = pack_gqa # True if (128 % qhead_per_kvhead == 0) else False
         self.q_subtile_factor = q_subtile_factor
         if pack_gqa:
             assert m_block_size % self.qhead_per_kvhead == 0, (
@@ -161,12 +161,12 @@ class FlashAttentionForwardSm100:
         # self.s0_s1_barrier = self.head_dim_padded in [64, 96] and (not self.is_causal and not self.is_local)
         is_sm103 = self.arch >= Arch.sm_103 and self.arch <= Arch.sm_103f
         # self.enable_ex2_emu = self.head_dim_padded <= 128 and not is_sm103
-        self.enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103
+        self.enable_ex2_emu = (self.head_dim_padded <= 128 or (self.head_dim_padded == 192 and self.use_2cta_instrs and not self.is_causal and not self.is_local)) and not is_sm103  # True
         self.s0_s1_barrier = False
         self.overlap_sO_sQ = (
             (self.head_dim_padded == 192 and self.head_dim_v_padded >= 64) or
             (self.head_dim_v_padded >= 128 and self.is_split_kv)
-        )
+        )  # False if not is_split_kv else True
         if self.overlap_sO_sQ:
             self.is_persistent = False
 
@@ -181,8 +181,10 @@ class FlashAttentionForwardSm100:
         self.epilogue_warp_ids = (13,)
         self.load_warp_ids = (14,)
         self.empty_warp_ids = (15,)
+        # 512
         self.tmem_alloc_cols = cute.arch.get_max_tmem_alloc_cols("sm_100")
 
+        # 16 * 32 = 512
         self.threads_per_cta = cute.arch.WARP_SIZE * len(
             (
                 *self.softmax0_warp_ids,
@@ -212,19 +214,43 @@ class FlashAttentionForwardSm100:
         elif self.is_varlen_q: # fallback
             self.epilogue_warp_ids = (13, 14)
 
+        # 最终 warp_ids:
+        # stage 1
+        # self.softmax0_warp_ids = (0, 1, 2, 3)
+        # self.softmax1_warp_ids = ()
+        # self.correction_warp_ids = (8, 9, 10, 11)
+        # self.mma_warp_id = 12
+        # self.epilogue_warp_ids = (8, 9, 10, 11)
+        # self.load_warp_ids = (14,)
+        # self.empty_warp_ids = (15, 4, 5, 6, 7, 13) = (15, (softmax1_warp_ids), (origin epilogue_warp_ids))
+        # stage 2
+        # self.softmax0_warp_ids = (0, 1, 2, 3)
+        # self.softmax1_warp_ids = (4, 5, 6, 7)
+        # self.correction_warp_ids = (8, 9, 10, 11)
+        # self.mma_warp_id = 12
+        # self.epilogue_warp_ids = (8, 9, 10, 11)
+        # self.load_warp_ids = (14,)
+        # self.empty_warp_ids = (15, 13)
+
+        # [0, 128] 论文中写的两个MMA交替流水线(即时Q很短，一个CTA内只做1个MMA，但还是会分配2块，降低代码逻辑?)
         self.tmem_s_offset = [0, self.n_block_size]  # e.g., 0, 128
+        # 1 stage [256] or 2 stage [256, 384]
         self.tmem_o_offset = [
             self.tmem_s_offset[-1] + self.n_block_size + i * self.head_dim_v_padded
             for i in range(self.q_stage)
         ]  # e.g., 256, 384
+        # 1 stage [384] or 2 stage [512]
         self.tmem_total = self.tmem_o_offset[-1] + self.head_dim_v_padded
+        # 1个stage就刚好用完tmem了。为什么还有2stage？难道因为O是bf16，所有128就可以存储2个stage？
         assert self.tmem_total <= self.tmem_alloc_cols
+        # 64
         self.tmem_s_to_p_offset = self.n_block_size // 2
+        # [64, 192]
         self.tmem_p_offset = [
             self.tmem_s_offset[i] + self.tmem_s_to_p_offset for i in range(2)
         ]  # 0, 128
 
-        # vec buffer for row_max & row_sum
+        # vec buffer for row_max & row_sum, [64, 192]
         self.tmem_vec_offset = self.tmem_s_offset
 
         if self.head_dim_padded < 96:
@@ -264,13 +290,15 @@ class FlashAttentionForwardSm100:
         - Sets up staging parameters for Q, K, V inputs and accumulator data
         - Configures pipeline stages for softmax, correction, and epilogue operations
         """
-
+        # 1 * 128 * 128 * 16 // 8 = 32768 or 65536
         smem_size_q = self.q_stage * self.m_block_size * self.head_dim_padded * self.q_dtype.width // 8
+        # 1stage 32768 or 2stage 65536
         smem_size_o = self.q_stage * self.m_block_size * self.head_dim_v_padded * self.o_dtype.width // 8
         smem_size_q_o = smem_size_q + smem_size_o if not self.overlap_sO_sQ else max(smem_size_q, smem_size_o)
         smem_size_k_per_stage = self.n_block_size * self.head_dim_padded * self.k_dtype.width // 8
         smem_size_v_per_stage = self.n_block_size * self.head_dim_v_padded * self.v_dtype.width // 8
         smem_size_kv_per_stage = max(smem_size_k_per_stage, smem_size_v_per_stage) // self.cta_group_size
+        # B卡每个sm的L1+smem 256 KB, smem最大228KB; smem 224KB, L1 32KB
         kv_stage = (224 * 1024 - smem_size_q_o) // smem_size_kv_per_stage
         if self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and kv_stage == 2:
             # For hdim 192,128, we can fit 3 stages if we use uneven_kv_smem
@@ -285,9 +313,11 @@ class FlashAttentionForwardSm100:
         # 128 x 192 and smem_small is 128 x 128. We set the stride between the stages to be
         # 128 * 160, so that indexing the 0th and 2nd stages will get the right address,
         # but for the 1st stage we need to add or subtract (depending on phase) 128 x 64.
+        # False
         self.uneven_kv_smem = (
             self.head_dim_padded == 192 and self.head_dim_v_padded == 128 and self.kv_stage == 3
         )
+        # 0
         self.uneven_kv_smem_offset = (
             self.m_block_size * (self.head_dim_padded - self.head_dim_v_padded) // 2
             if self.uneven_kv_smem
@@ -335,6 +365,7 @@ class FlashAttentionForwardSm100:
         self.v_dtype = mV.element_type
         self.o_dtype = mO.element_type
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        # (total_q, d, h)
         Q_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
         mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=Q_layout_transpose))
         # (s_k, d, h_k, b_k) or (total_k, d, h_k) if there's cu_seqlens_k or (page_size, d, h_k, num_pages) if there's page_table
@@ -351,6 +382,7 @@ class FlashAttentionForwardSm100:
             O_layout_transpose = [1, 3, 2, 0] if const_expr(mCuSeqlensQ is None) else [0, 2, 1]
             LSE_layout_transpose = [2, 1, 0] if const_expr(mCuSeqlensQ is None) else [1, 0]
             num_splits = Int32(1)
+        # (total_q, dv, h)
         mO = cute.make_tensor(mO.iterator, cute.select(mO.layout, mode=O_layout_transpose))
         mLSE = (
             cute.make_tensor(mLSE.iterator, cute.select(mLSE.layout, mode=LSE_layout_transpose))
@@ -358,6 +390,7 @@ class FlashAttentionForwardSm100:
             else None
         )
         # (s, d, h, b) -> (d, s, h, b)
+        # (total_k, d, h_k) -> (d, total_k, h_k)
         V_layout_transpose = [1, 0, 2, 3] if const_expr(mCuSeqlensK is None) else [1, 0, 2]
         mV = cute.make_tensor(mV.iterator, cute.select(mV.layout, mode=V_layout_transpose))
 
@@ -367,6 +400,7 @@ class FlashAttentionForwardSm100:
         if const_expr(self.q_dtype != self.v_dtype):
             raise TypeError(f"Type mismatch: {self.q_dtype} != {self.v_dtype}")
         self._setup_attributes()
+        # False if varlen
         self.use_tma_O = self.arch >= Arch.sm_90 and mCuSeqlensQ is None and mSeqUsedQ is None
         # This can be tuned
         # This is currently very ad-hoc, we should tune it systematically
@@ -409,6 +443,8 @@ class FlashAttentionForwardSm100:
             self.mma_tiler_pv[:2],
             p_source,
         )
+        print(f'{tiled_mma_qk=}')
+        print(f'{tiled_mma_pv=}')
 
         self.cluster_shape_mnk = (*self.cluster_shape_mn, 1)
         cta_layout_vmnk = cute.tiled_divide(
@@ -418,6 +454,7 @@ class FlashAttentionForwardSm100:
         # epi_tile is per-CTA (not full 2CTA) since each CTA writes its own O portion
         self.epi_tile = (self.m_block_size, self.head_dim_v_padded)
 
+        # ((MMA), (self.cta_group_size * m_block_size) // MMA_M, self.head_dim_padded // MMA_K)
         sQ_layout = sm100_utils_basic.make_smem_layout_a(
             tiled_mma_qk, self.mma_tiler_qk, self.q_dtype, self.q_stage
         )
@@ -462,33 +499,40 @@ class FlashAttentionForwardSm100:
             )
 
         if const_expr(self.pack_gqa):
+            # 对q、o的shape、stride操作，实现 根据k的head_id 直接索引到q的head_id
+            # (total_q, d, h) -> ((qhead_per_kvhead, total_q), d, h_k)
             shape_Q_packed = (
                 (self.qhead_per_kvhead, mQ.shape[0]),
                 mQ.shape[1],
                 mK.shape[2],
                 *mQ.shape[3:],
             )
+            # (d*h, 1, d) -> ((d, d*h), 1, d*qhead_per_kvhead)
             stride_Q_packed = (
                 (mQ.stride[2], mQ.stride[0]),
                 mQ.stride[1],
                 mQ.stride[2] * self.qhead_per_kvhead,
                 *mQ.stride[3:],
             )
+            # ((qhead_per_kvhead, total_q), d, h_k):((d, d*h), 1, d*qhead_per_kvhead)
             mQ = cute.make_tensor(
                 mQ.iterator, cute.make_layout(shape_Q_packed, stride=stride_Q_packed)
             )
+            # (total_q, dv, h) -> ((qhead_per_kvhead, total_q), dv, h_k)
             shape_O_packed = (
                 (self.qhead_per_kvhead, mO.shape[0]),
                 mO.shape[1],
                 mK.shape[2],
                 *mO.shape[3:],
             )
+            # (dv*h, 1, dv) -> ((dv, dv*h), 1, dv*qhead_per_kvhead)
             stride_O_packed = (
                 (mO.stride[2], mO.stride[0]),
                 mO.stride[1],
                 mO.stride[2] * self.qhead_per_kvhead,
                 *mO.stride[3:],
             )
+            # ((qhead_per_kvhead, total_q), dv, h_k):((dv, dv*h), 1, dv*qhead_per_kvhead)
             mO = cute.make_tensor(
                 mO.iterator, cute.make_layout(shape_O_packed, stride=stride_O_packed)
             )
@@ -507,6 +551,15 @@ class FlashAttentionForwardSm100:
                     mLSE.iterator, cute.make_layout(shape_LSE_packed, stride=stride_LSE_packed)
                 )
 
+        cute.printf(f'{mQ.layout=}')
+        cute.printf(mK.layout)
+        cute.printf(mV.layout)
+        cute.printf(mO.layout)
+        print(f'{sQ_layout.outer=}\n{sQ_layout.inner=}')
+        cute.printf(f'{sQ_layout=}')
+        cute.printf(f'{sK_layout=}')
+        cute.printf(f'{sV_layout=}')
+        cute.printf(f'{sO_layout=}')
         self.tma_copy_bytes = {
             name: cute.size_in_bytes(mX.element_type, cute.select(layout, mode=[0, 1, 2]))
             for name, mX, layout in [
@@ -554,6 +607,7 @@ class FlashAttentionForwardSm100:
             )
 
         self.num_epilogue_threads = cute.arch.WARP_SIZE * len(self.epilogue_warp_ids)
+        # False if varlen
         if const_expr(self.use_tma_O):
             tma_atom_O, mO = cpasync.make_tiled_tma_atom(
                 tma_store_op, mO, cute.select(sO_layout, mode=[0, 1]), self.epi_tile
@@ -577,6 +631,10 @@ class FlashAttentionForwardSm100:
             assert self.m_block_size % tO_layout.shape[0] == 0
             vO_layout = cute.make_layout((1, async_copy_elems))
             gmem_tiled_copy_O = cute.make_tiled_copy_tv(atom_universal_copy, tO_layout, vO_layout)
+        cute.printf(f'{sO_layout.outer=}')
+        cute.printf(f'{tO_layout=}')
+        cute.printf(f'{vO_layout=}')
+        print(f'{gmem_tiled_copy_O=}')
 
         if const_expr(mCuSeqlensQ is not None or mSeqUsedQ is not None):
             TileScheduler = SingleTileVarlenScheduler
@@ -614,9 +672,14 @@ class FlashAttentionForwardSm100:
             is_split_kv=self.is_split_kv,
             cluster_shape_mn=self.cluster_shape_mn,
         )
+        print(f'{tile_sched_args=}')
+        cute.printf(mQ.shape)
+        cute.printf(tile_sched_args.num_block)
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
+        print(f'{tile_sched_params=}')
         self.tile_scheduler_cls = TileScheduler
         grid_dim = TileScheduler.get_grid_shape(tile_sched_params)
+        cute.printf(f'{grid_dim=}')
 
         sO_size = cute.cosize(sO_layout) if const_expr(not self.overlap_sO_sQ) else 0
         sQ_size = (
